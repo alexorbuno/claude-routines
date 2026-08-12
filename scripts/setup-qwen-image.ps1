@@ -147,44 +147,83 @@ function Write-Warn2($msg){ Write-Host "  [!]  $msg" -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------- ComfyUI path
 
-function Find-ComfyUIRoot {
-    # ComfyUI Desktop пишет путь к моделям в extra_models_config.yaml
+function Find-ComfyUIRoots {
+    # Возвращает ВСЕ найденные установки с пометкой, откуда взялся путь.
+    # Молча выбирать первую нельзя: на одной машине часто стоят и portable, и Desktop,
+    # а Desktop к тому же умеет ссылаться на папку моделей от portable.
+    $found = @()
+
+    # ComfyUI Desktop держит путь к моделям в extra_models_config.yaml.
+    # Секций с base_path в файле может быть несколько - собираем все.
     $cfg = Join-Path $env:APPDATA 'ComfyUI\extra_models_config.yaml'
     if (Test-Path $cfg) {
+        $section = ''
         foreach ($line in Get-Content $cfg) {
+            if ($line -match '^(\S+):\s*$') { $section = $Matches[1]; continue }
             if ($line -match '^\s*base_path:\s*(.+?)\s*$') {
                 $p = $Matches[1].Trim('"').Trim("'")
-                if (Test-Path $p) { return (Resolve-Path $p).Path }
+                if (Test-Path (Join-Path $p 'models')) {
+                    $found += [pscustomobject]@{
+                        Path   = (Resolve-Path $p).Path
+                        Source = "extra_models_config.yaml, секция '$section'"
+                    }
+                }
             }
         }
     }
-    $candidates = @(
+
+    foreach ($c in @(
         (Join-Path $env:USERPROFILE 'Documents\ComfyUI'),
         (Join-Path $env:USERPROFILE 'ComfyUI'),
         'C:\ComfyUI',
-        'D:\ComfyUI',
-        (Join-Path $env:USERPROFILE 'AppData\Local\Programs\@comfyorgcomfyui-electron\resources\ComfyUI')
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c 'models')) { return (Resolve-Path $c).Path }
+        'D:\ComfyUI'
+    )) {
+        if (Test-Path (Join-Path $c 'models')) {
+            $found += [pscustomobject]@{ Path = (Resolve-Path $c).Path; Source = 'типовой путь установки' }
+        }
     }
-    return $null
+
+    # Уникальные пути, порядок сохраняем: конфиг Desktop важнее догадок.
+    return $found | Group-Object Path | ForEach-Object { $_.Group[0] }
 }
 
 Write-Step 'Поиск ComfyUI'
-if (-not $ComfyUIPath) { $ComfyUIPath = Find-ComfyUIRoot }
 if (-not $ComfyUIPath) {
-    Write-Host @'
+    $roots = @(Find-ComfyUIRoots)
+
+    if ($roots.Count -eq 0) {
+        Write-Host @'
 Не удалось найти ComfyUI автоматически.
 
-Открой ComfyUI Desktop -> Settings (шестерёнка) -> Server-Config / About,
-там указан путь установки. Затем запусти скрипт с этим путём:
+Открой ComfyUI Desktop -> Settings (шестерёнка) -> About / Server-Config,
+там указана директория установки. Затем запусти скрипт с этим путём:
 
   powershell -ExecutionPolicy Bypass -File .\setup-qwen-image.ps1 -ComfyUIPath "C:\путь\к\ComfyUI"
 
 Нужная папка - та, внутри которой лежит подпапка models\.
 '@ -ForegroundColor Red
-    exit 1
+        exit 1
+    }
+
+    if ($roots.Count -gt 1) {
+        # Несколько установок - выбор за пользователем, 37 ГБ не туда это дорого.
+        Write-Host "`nНайдено несколько установок ComfyUI:" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $roots.Count; $i++) {
+            Write-Host ("  [{0}] {1}" -f ($i + 1), $roots[$i].Path)
+            Write-Host ("      источник: {0}" -f $roots[$i].Source) -ForegroundColor DarkGray
+        }
+        Write-Host ''
+        $answer = Read-Host "Куда ставить модели? Номер 1-$($roots.Count), или Enter для отмены"
+        $idx = 0
+        if (-not [int]::TryParse($answer, [ref]$idx) -or $idx -lt 1 -or $idx -gt $roots.Count) {
+            Write-Host 'Отменено. Запусти снова с явным -ComfyUIPath "путь".' -ForegroundColor Red
+            exit 1
+        }
+        $ComfyUIPath = $roots[$idx - 1].Path
+    } else {
+        $ComfyUIPath = $roots[0].Path
+        Write-Host ("  источник пути: {0}" -f $roots[0].Source) -ForegroundColor DarkGray
+    }
 }
 
 $ModelsDir = Join-Path $ComfyUIPath 'models'
