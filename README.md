@@ -46,12 +46,20 @@ crontab -e
 ### Запуск (Windows, PowerShell)
 
 ```powershell
-# Рекомендуется для RTX 4090 / 24 ГБ VRAM
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1
+# Быстрый старт: лёгкий квант + удобные ноды
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 -Quant q4_k_m -Extras
 
 # Другой квант и явный путь к ComfyUI
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 -Quant fp8 -ComfyUIPath "D:\ComfyUI"
 ```
+
+Ключ `-Extras` доставляет две ноды:
+
+- [**ComfyUI-Layers**](https://github.com/alessandrozonta/ComfyUI-Layers) — складывает
+  батч слоёв в один `.psd`. Без неё ComfyUI сохранит слои россыпью PNG, и собирать
+  их в Photoshop придётся руками.
+- [**ComfyUI-Crystools**](https://github.com/crystian/ComfyUI-Crystools) — монитор
+  VRAM/RAM в интерфейсе, помогает подбирать квант и разрешение без угадывания.
 
 ### Выбор точности
 

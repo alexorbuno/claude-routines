@@ -24,6 +24,9 @@
 .PARAMETER SkipLora
     Не скачивать LoRA Stable-Layers (только базовая модель Qwen-Image-Layered).
 
+.PARAMETER Extras
+    Доставить QoL custom nodes: экспорт слоёв в PSD и монитор VRAM в интерфейсе.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\setup-qwen-image-layered.ps1
 
@@ -38,7 +41,9 @@ param(
 
     [string]$ComfyUIPath,
 
-    [switch]$SkipLora
+    [switch]$SkipLora,
+
+    [switch]$Extras
 )
 
 $ErrorActionPreference = 'Stop'
@@ -274,27 +279,48 @@ if (-not $SkipLora) {
     }
 }
 
-# ------------------------------------------------- 5. Custom node ComfyUI-GGUF
+# ------------------------------------------------------------ 5. Custom nodes
 
-if ($IsGGUF) {
-    Write-Step 'Custom node ComfyUI-GGUF'
+function Install-CustomNode {
+    param([string]$Name, [string]$RepoUrl, [string]$Why)
+
     $customNodes = Join-Path $ComfyUIPath 'custom_nodes'
     if (-not (Test-Path $customNodes)) { New-Item -ItemType Directory -Path $customNodes -Force | Out-Null }
-    $ggufDir = Join-Path $customNodes 'ComfyUI-GGUF'
+    $target = Join-Path $customNodes $Name
 
-    if (Test-Path $ggufDir) {
-        Write-Ok 'ComfyUI-GGUF уже установлен'
-    } elseif (Get-Command git -ErrorAction SilentlyContinue) {
-        git clone --depth 1 https://github.com/city96/ComfyUI-GGUF "$ggufDir"
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok 'ComfyUI-GGUF установлен'
-            Write-Warn2 'Нужна зависимость gguf. Проще всего: в ComfyUI открой Manager -> Install Missing Custom Nodes, либо в консоли ComfyUI Desktop выполни: pip install gguf'
-        } else {
-            Write-Warn2 'git clone не удался — поставь ComfyUI-GGUF через ComfyUI Manager (поиск "GGUF")'
-        }
-    } else {
-        Write-Warn2 'git не найден. Поставь ComfyUI-GGUF через ComfyUI Manager: Manager -> Custom Nodes Manager -> поиск "ComfyUI-GGUF" -> Install'
+    if (Test-Path $target) { Write-Ok "$Name уже установлен"; return }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Warn2 "git не найден — поставь '$Name' через ComfyUI Manager (Custom Nodes Manager -> поиск)"
+        return
     }
+
+    Write-Host "  $Name - $Why"
+    git clone --depth 1 $RepoUrl "$target" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "$Name установлен"
+        # requirements.txt каждой ноды ставит сам ComfyUI Desktop при следующем старте;
+        # если не подхватит - Manager -> Install Missing Custom Nodes добьёт зависимости.
+    } else {
+        Write-Warn2 "git clone $Name не удался — поставь через ComfyUI Manager"
+    }
+}
+
+if ($IsGGUF) {
+    Write-Step 'Custom node ComfyUI-GGUF (обязателен для .gguf)'
+    Install-CustomNode -Name 'ComfyUI-GGUF' -RepoUrl 'https://github.com/city96/ComfyUI-GGUF' `
+                       -Why 'лоадер GGUF-моделей'
+    Write-Warn2 'Нужна python-зависимость gguf. Если ComfyUI не подхватит сам: Manager -> Install Missing Custom Nodes'
+}
+
+if ($Extras) {
+    Write-Step 'Дополнительные ноды (-Extras)'
+    # Главное для layered-модели: она отдаёт батч RGBA-слоёв, а ComfyUI по умолчанию
+    # сохраняет их отдельными PNG. Эта нода складывает батч в один .psd со слоями.
+    Install-CustomNode -Name 'ComfyUI-Layers' -RepoUrl 'https://github.com/alessandrozonta/ComfyUI-Layers' `
+                       -Why 'сохранение батча слоёв в один PSD'
+    # Монитор VRAM/RAM прямо в интерфейсе - полезно при подборе кванта и разрешения.
+    Install-CustomNode -Name 'ComfyUI-Crystools' -RepoUrl 'https://github.com/crystian/ComfyUI-Crystools' `
+                       -Why 'монитор VRAM/RAM/GPU в интерфейсе'
 }
 
 # ------------------------------------------------------------------- Итог
@@ -321,4 +347,15 @@ Write-Host @"
      но разделение слоёв постепенно деградирует.
   7. LoRA Stable-Layers: нода "LoraLoaderModelOnly" между лоадером модели и
      сэмплером, strength 1.0 для старта. Работает и поверх GGUF.
+  8. Если ставил -Extras: вместо "Save Image" подключи ноду сохранения из
+     ComfyUI-Layers - получишь один .psd со слоями вместо россыпи PNG.
 "@ -ForegroundColor Gray
+
+if ($Quant -eq 'q4_k_m') {
+    Write-Host @'
+Замечание по q4_k_m: это самый агрессивный квант из разумных. Генерация быстрая,
+но разделение на слои у него аккуратное не всегда - чаще попадаются полупустые
+слои и остатки объекта на фоне. Если увидишь это на своих картинках, первым делом
+пробуй q6_k (тот же скрипт с -Quant q6_k), он на 4090 тоже помещается.
+'@ -ForegroundColor DarkYellow
+}
