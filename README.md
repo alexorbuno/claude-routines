@@ -33,31 +33,41 @@ crontab -e
 
 ## Qwen-Image-Layered для ComfyUI (`scripts/setup-qwen-image-layered.ps1`)
 
-Ставит в локальный ComfyUI (Desktop или portable) модель
-[Qwen-Image-Layered](https://comfyui-wiki.com/en/news/2025-12-19-qwen-image-layered-release) —
-разбор картинки на редактируемые RGBA-слои — плюс LoRA
-[Stable-Layers](https://stability-ai.github.io/stable-layers.github.io/) от Stability AI
-(дообучение базовой модели через Flow-GRPO с VLM-наградой).
+Ставит в локальный ComfyUI (Desktop или portable) модели семейства Qwen-Image:
+
+- **`-Model layered`** — [Qwen-Image-Layered](https://comfyui-wiki.com/en/news/2025-12-19-qwen-image-layered-release):
+  разбирает картинку на редактируемые RGBA-слои. Плюс LoRA
+  [Stable-Layers](https://stability-ai.github.io/stable-layers.github.io/) от Stability AI
+  (дообучение базовой модели через Flow-GRPO с VLM-наградой).
+- **`-Model edit`** — [Qwen-Image-Edit-2511](https://blog.comfy.org/p/qwen-image-edit-2511-and-qwen-image):
+  правит изображение по текстовой инструкции. С `-Lightning` доедет
+  [4-шаговая LoRA](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) вместо 40 шагов.
+- **`-Model both`** — обе. Text encoder у них общий, так что второй прогон
+  докачает только DiT и VAE.
 
 Скрипт сам находит папку ComfyUI, тянет имена файлов из HuggingFace API
-(не хардкодит их, поэтому не ломается при переименованиях), качает через `curl`
-с докачкой и ставит `ComfyUI-GGUF`, если выбран GGUF-квант.
+(не хардкодит их, поэтому не ломается при переименованиях), перебирает несколько
+репозиториев-зеркал, качает через `curl` с докачкой и ставит `ComfyUI-GGUF`,
+если выбран GGUF-квант.
 
 ### Запуск (Windows, PowerShell)
 
 ```powershell
-# Быстрый старт: лёгкий квант + удобные ноды
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 -Quant q4_k_m -Extras
+# Слои: лёгкий квант + удобные ноды
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model layered -Quant q4_k_m -Extras
 
-# Другой квант и явный путь к ComfyUI
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 -Quant fp8 -ComfyUIPath "D:\ComfyUI"
+# Редактирование с ускорением до 4 шагов
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model edit -Quant q4_k_m -Lightning
+
+# Всё сразу + явный путь к ComfyUI
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model both -Quant q4_k_m -Lightning -Extras -ComfyUIPath "D:\ComfyUI"
 ```
 
-Ключ `-Extras` доставляет две ноды:
+Ключ `-Extras` доставляет:
 
-- [**ComfyUI-Layers**](https://github.com/alessandrozonta/ComfyUI-Layers) — складывает
-  батч слоёв в один `.psd`. Без неё ComfyUI сохранит слои россыпью PNG, и собирать
-  их в Photoshop придётся руками.
+- [**ComfyUI-Layers**](https://github.com/alessandrozonta/ComfyUI-Layers) (только для
+  `layered`) — складывает батч слоёв в один `.psd`. Без неё ComfyUI сохранит слои
+  россыпью PNG, и собирать их в Photoshop придётся руками.
 - [**ComfyUI-Crystools**](https://github.com/crystian/ComfyUI-Crystools) — монитор
   VRAM/RAM в интерфейсе, помогает подбирать квант и разрешение без угадывания.
 
@@ -68,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 
 | `q4_k_m` | ~13 ГБ | 12–16 ГБ VRAM, быстро, качество заметно ниже |
 | `q6_k`   | ~17 ГБ | **по умолчанию, оптимум для 24 ГБ** |
 | `q8_0`   | ~22 ГБ | 24 ГБ впритык, будет оффлоад в RAM |
-| `fp8`    | ~20 ГБ | официальный `fp8mixed`, без custom nodes |
+| `fp8`    | ~20 ГБ | официальные сборки Comfy-Org, без custom nodes |
 | `bf16`   | ~41 ГБ | только для 48 ГБ+ |
 
 Для GGUF нужен `models/unet`, для fp8/bf16 — `models/diffusion_models`;
@@ -76,9 +86,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image-layered.ps1 
 
 ### Что важно помнить в workflow
 
-- У Qwen-Image-Layered **свой VAE** — обычный `qwen_image_vae` не отдаёт альфа-канал.
+Общее:
+
+- Для GGUF в шаблоне надо заменить `Load Diffusion Model` на `Unet Loader (GGUF)`.
+  Шаблоны приходят как Subgraph — чтобы добраться до лоадеров, зайдите внутрь двойным кликом.
+
+`layered`:
+
+- **Свой VAE** — обычный `qwen_image_vae` не отдаёт альфа-канал.
 - Для fp8 нужен именно `fp8mixed`; обычный `fp8_e4m3fn` эту модель ломает.
 - Число слоёв задаётся виджетом `layers` на ноде `Empty Qwen Image Layered Latent`.
   На выходе `layers + 1` картинок — первая это полное изображение, а не слой.
 - Стартовое разрешение ~640 px по короткой стороне; выше разделение слоёв деградирует.
 - LoRA Stable-Layers подключается нодой `LoraLoaderModelOnly`, работает и поверх GGUF.
+
+`edit`:
+
+- VAE здесь **обычный** (`qwen_image_vae`), не layered.
+- Исходная картинка идёт в ноду `TextEncodeQwenImageEdit` вместе с инструкцией —
+  она кодирует изображение и промпт совместно, обычный `CLIP Text Encode` не подойдёт.
+- Без Lightning LoRA: ~40 шагов, cfg 4.0. С Lightning: 4 шага, cfg **1.0** —
+  на cfg 4.0 с 4 шагами получите пересвет и артефакты.
