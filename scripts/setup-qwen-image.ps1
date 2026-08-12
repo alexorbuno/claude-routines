@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Ставит модели семейства Qwen-Image в локальный ComfyUI: layered (разбор на
     RGBA-слои) или edit (редактирование по текстовой инструкции).
@@ -68,6 +68,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+# Windows PowerShell 5.1 по умолчанию печатает в консоль в кодировке кодовой страницы
+# (866/1251), из-за чего кириллица в выводе рассыпается. Сам файл сохранён с UTF-8 BOM,
+# чтобы парсер прочитал его верно; здесь дополнительно выравниваем вывод консоли.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {
+    # Не критично: в некоторых хостах (ISE, редиректы) консоль недоступна.
+}
 
 $IsGGUF = $Quant -in 'q4_k_m', 'q6_k', 'q8_0'
 
