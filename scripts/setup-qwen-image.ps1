@@ -123,6 +123,7 @@ $ModelSpecs = @{
         LoraRepos    = $LayeredLoraRepos
         LoraPatterns = @('(?i)\.safetensors$')
         LoraLabel    = 'LoRA Stable-Layers'
+        LoraPrefix   = 'stable-layers'
     }
     edit = @{
         Title        = 'Qwen-Image-Edit-2511 (правка по инструкции)'
@@ -136,6 +137,7 @@ $ModelSpecs = @{
         LoraPatterns = @('(?i)4steps.*bf16.*\.safetensors$', '(?i)4steps.*\.safetensors$',
                          '(?i)8steps.*\.safetensors$', '(?i)\.safetensors$')
         LoraLabel    = 'Lightning LoRA (4 шага)'
+        LoraPrefix   = 'qwen-image-edit-2511-lightning'
     }
 }
 
@@ -256,15 +258,22 @@ if (-not (Test-Path $Curl)) {
 # --------------------------------------------------------------- HF API utils
 
 function Get-HFFileList {
+    # HF периодически отвечает 401/429 при частых запросах, плюс бывают обрывы связи.
+    # Три попытки с нарастающей паузой отсекают почти все такие ложные "репозиторий недоступен".
     param([string]$Repo)
     $url = "https://huggingface.co/api/models/$Repo" + '?full=true'
-    try {
-        $json = (& $Curl -sSL --fail --max-time 60 $url) -join ''
-        if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
-        return ($json | ConvertFrom-Json).siblings.rfilename
-    } catch {
-        return @()
+    foreach ($attempt in 1..3) {
+        try {
+            $json = (& $Curl -sSL --fail --max-time 60 $url) -join ''
+            if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" }
+            $names = ($json | ConvertFrom-Json).siblings.rfilename
+            if ($names) { return $names }
+        } catch {
+            # разбираться не в чем: любая неудача лечится повтором или переходом к зеркалу
+        }
+        if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
     }
+    return @()
 }
 
 function Resolve-HFFile {
@@ -292,24 +301,50 @@ function Find-InRepos {
     return $null
 }
 
-function Get-HFDownload {
-    param([string]$Repo, [string]$RemotePath, [string]$DestDir, [string]$Label)
+# Итоговый отчёт: что доехало, а что нет. Заполняется по ходу дела.
+$script:Done    = @()
+$script:Missing = @()
 
-    $name = Split-Path $RemotePath -Leaf
+function Get-RemoteSize {
+    # HEAD у HF иногда не отдаёт Content-Length (редирект на CDN, троттлинг).
+    # Без размера нельзя отличить целый файл от оборванного, поэтому пробуем трижды.
+    param([string]$Url)
+    foreach ($attempt in 1..3) {
+        $head = & $Curl -sIL --max-time 60 $Url 2>$null
+        $size = 0
+        foreach ($h in $head) {
+            if ($h -match '^\s*[Cc]ontent-[Ll]ength:\s*(\d+)') { $size = [int64]$Matches[1] }
+        }
+        if ($size -gt 0) { return $size }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+    return 0
+}
+
+function Get-HFDownload {
+    # SaveAs - переименование при сохранении: в некоторых репозиториях веса лежат
+    # под безликим именем вроде adapter_model.safetensors, и в общей папке loras
+    # такое опознать невозможно.
+    param([string]$Repo, [string]$RemotePath, [string]$DestDir, [string]$Label, [string]$SaveAs)
+
+    $name = if ($SaveAs) { $SaveAs } else { Split-Path $RemotePath -Leaf }
     $dest = Join-Path $DestDir $name
     $url  = "https://huggingface.co/$Repo/resolve/main/$RemotePath" + '?download=true'
 
-    # Размер на сервере: отличить «уже скачано» от «нужна докачка»
-    $remoteSize = 0
-    $head = & $Curl -sIL --max-time 60 $url 2>$null
-    foreach ($h in $head) {
-        if ($h -match '^\s*[Cc]ontent-[Ll]ength:\s*(\d+)') { $remoteSize = [int64]$Matches[1] }
-    }
+    $remoteSize = Get-RemoteSize $url
 
     if (Test-Path $dest) {
         $localSize = (Get-Item $dest).Length
         if ($remoteSize -gt 0 -and $localSize -eq $remoteSize) {
             Write-Ok "$Label уже на месте ($([math]::Round($localSize/1GB,2)) ГБ): $name"
+            $script:Done += $Label
+            return
+        }
+        if ($remoteSize -eq 0) {
+            # Размер неизвестен: докачка вслепую может испортить целый файл, поэтому
+            # оставляем как есть и говорим об этом прямо.
+            Write-Warn2 "$Label уже есть, но размер на сервере не читается - оставляю как есть: $name"
+            $script:Done += $Label
             return
         }
         Write-Host "  докачиваю $name ($([math]::Round($localSize/1GB,2)) из $([math]::Round($remoteSize/1GB,2)) ГБ)"
@@ -320,10 +355,12 @@ function Get-HFDownload {
 
     & $Curl -L --fail --retry 5 --retry-delay 3 -C - --progress-bar -o "$dest" $url
     if ($LASTEXITCODE -ne 0) {
-        Write-Warn2 "Загрузка $name прервалась (curl $LASTEXITCODE). Запусти скрипт снова - докачает с места обрыва."
+        Write-Warn2 "Загрузка $name прервалась (curl $LASTEXITCODE) - запусти скрипт снова, докачает с места обрыва."
+        $script:Missing += "$Label (оборвалась загрузка)"
         return
     }
     Write-Ok "$Label готов: $name"
+    $script:Done += $Label
 }
 
 # --------------------------------------------- Text encoder (общий, один раз)
@@ -336,7 +373,8 @@ $te = Find-InRepos -Repos @($RepoQwenImg) -Patterns @(
 if ($te) {
     Get-HFDownload -Repo $te.Repo -RemotePath $te.Path -DestDir $DirTextEnc -Label 'Text encoder'
 } else {
-    Write-Warn2 'Text encoder не найден - скачай qwen_2.5_vl_7b_fp8_scaled.safetensors в models\text_encoders\'
+    Write-Warn2 'Text encoder не найден - скорее всего временный сбой сети. Перезапусти скрипт.'
+    $script:Missing += 'Text encoder (без него не работает ни одна из моделей)'
 }
 
 # ------------------------------------------------------- Модели по очереди
@@ -354,6 +392,7 @@ foreach ($target in $Targets) {
     } else {
         Write-Warn2 "DiT для '$target' в точности '$Quant' не найден ни в одном источнике."
         Write-Host  "      Проверь вручную: https://huggingface.co/$($spec.DitRepos[0])/tree/main"
+        $script:Missing += "DiT $target"
         continue
     }
 
@@ -363,16 +402,25 @@ foreach ($target in $Targets) {
         Get-HFDownload -Repo $vae.Repo -RemotePath $vae.Path -DestDir $DirVae -Label "VAE $target"
     } else {
         Write-Warn2 "VAE для '$target' не найден автоматически."
+        $script:Missing += "VAE $target"
     }
 
     # LoRA
     if ($spec.LoraRepos.Count -gt 0) {
         $lora = Find-InRepos -Repos $spec.LoraRepos -Patterns $spec.LoraPatterns
         if ($lora) {
-            Get-HFDownload -Repo $lora.Repo -RemotePath $lora.Path -DestDir $DirLora -Label $spec.LoraLabel
+            # Безликие имена (adapter_model.safetensors и подобные) в общей папке loras
+            # опознать нельзя - сохраняем под именем, говорящим что это за LoRA.
+            $leaf   = Split-Path $lora.Path -Leaf
+            $saveAs = if ($leaf -match '^adapter_model|^pytorch_lora_weights') {
+                          "$($spec.LoraPrefix)-$leaf"
+                      } else { $null }
+            Get-HFDownload -Repo $lora.Repo -RemotePath $lora.Path -DestDir $DirLora `
+                           -Label $spec.LoraLabel -SaveAs $saveAs
         } else {
             Write-Warn2 "$($spec.LoraLabel) не найдена - возможно, репозиторий gated (нужно принять лицензию на HF)."
             Write-Host  "      Проверь вручную: https://huggingface.co/$($spec.LoraRepos[0])/tree/main"
+            $script:Missing += $spec.LoraLabel
         }
     }
 }
@@ -393,13 +441,22 @@ function Install-CustomNode {
     }
 
     Write-Host "  $Name - $Why"
-    git clone --depth 1 $RepoUrl "$target" 2>&1 | Out-Null
+    # git пишет прогресс в stderr, а при $ErrorActionPreference='Stop' PowerShell
+    # превращает любую строку stderr нативной команды в терминирующий NativeCommandError
+    # и валит весь скрипт на успешном клоне. Ослабляем режим только на время вызова.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git clone --depth 1 --quiet $RepoUrl "$target" 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     if ($LASTEXITCODE -eq 0) {
         # requirements.txt ComfyUI Desktop доставит сам при следующем старте;
         # если не подхватит - Manager -> Install Missing Custom Nodes добьёт.
         Write-Ok "$Name установлен"
     } else {
-        Write-Warn2 "git clone $Name не удался - поставь через ComfyUI Manager"
+        Write-Warn2 "git clone $Name не удался (код $LASTEXITCODE) - поставь через ComfyUI Manager"
     }
 }
 
@@ -423,8 +480,21 @@ if ($Extras) {
 
 # ------------------------------------------------------------------- Итог
 
-Write-Step 'Готово'
+Write-Step 'Итог загрузки'
+foreach ($d in $script:Done) { Write-Ok $d }
+if ($script:Missing.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'НЕ ЗАГРУЖЕНО:' -ForegroundColor Red
+    foreach ($m in $script:Missing) { Write-Host "  - $m" -ForegroundColor Red }
+    Write-Host ''
+    Write-Host 'Запусти скрипт повторно той же командой: готовые файлы он пропустит,' -ForegroundColor Yellow
+    Write-Host 'оборванные догрузит с места обрыва.' -ForegroundColor Yellow
+} else {
+    Write-Ok 'Все файлы на месте.'
+}
+
 Write-Host @"
+
 Файлы разложены в:
   DiT           $DirDiT
   Text encoder  $DirTextEnc
