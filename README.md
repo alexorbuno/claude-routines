@@ -31,7 +31,7 @@ crontab -e
 - Claude Code CLI (`claude`) в PATH и авторизован
 - Настроены MCP-серверы: Notion, WebSearch
 
-## Qwen-Image-Layered для ComfyUI (`scripts/setup-qwen-image-layered.ps1`)
+## Qwen-Image для ComfyUI (`scripts/setup-qwen-image.ps1`)
 
 Ставит в локальный ComfyUI (Desktop или portable) модели семейства Qwen-Image:
 
