@@ -16,7 +16,9 @@
 .PARAMETER Model
     layered - Qwen-Image-Layered: раскладывает картинку на редактируемые RGBA-слои.
     edit    - Qwen-Image-Edit-2511: правит картинку по текстовой инструкции.
-    both    - поставить обе.
+    base    - Qwen-Image-2512: генерация с нуля, сильный рендеринг текста.
+    both    - layered + edit.
+    all     - все три.
 
 .PARAMETER Quant
     Точность DiT. Ориентиры по размеру даны для 20B-модели.
@@ -43,6 +45,14 @@
     Управление ракурсом для edit: LoRA Multiple-Angles плюс нода с 3D-вьюпортом,
     в которой ракурс задаётся мышью, а не текстом.
 
+.PARAMETER ControlNet
+    DiffSynth ControlNet-патчи (canny, depth, inpaint) в models\model_patches.
+    Управление композицией по карте глубины или контурам - для работы с рендерами.
+
+.PARAMETER Inpaint
+    Easy Inpaint LoRA к edit-модели: закрашиваешь область чёрным, промпт начинаешь
+    со слов "Inpaint the black areas." - без масок и нод препроцессинга.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\setup-qwen-image.ps1 -Model layered -Quant q4_k_m -Extras
 
@@ -55,7 +65,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('layered', 'edit', 'both')]
+    [ValidateSet('layered', 'edit', 'base', 'both', 'all')]
     [string]$Model = 'layered',
 
     [ValidateSet('q4_k_m', 'q6_k', 'q8_0', 'fp8', 'bf16')]
@@ -69,7 +79,11 @@ param(
 
     [switch]$Extras,
 
-    [switch]$Angles
+    [switch]$Angles,
+
+    [switch]$ControlNet,
+
+    [switch]$Inpaint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,22 +111,33 @@ if ($IsGGUF) {
     $EditDitRepos    = @('QuantStack/Qwen-Image-Edit-2511-GGUF',
                          'unsloth/Qwen-Image-Edit-2511-GGUF',
                          'QuantStack/Qwen-Image-Edit-GGUF')
+    $BaseDitRepos    = @('unsloth/Qwen-Image-2512-GGUF',
+                         'byteshape/Qwen-Image-2512-GGUF',
+                         'QuantStack/Qwen-Image-GGUF',
+                         'city96/Qwen-Image-gguf')
 } else {
     $LayeredDitRepos = @('Comfy-Org/Qwen-Image-Layered_ComfyUI')
     $EditDitRepos    = @('Comfy-Org/Qwen-Image-Edit_ComfyUI')
+    $BaseDitRepos    = @('Comfy-Org/Qwen-Image_ComfyUI')
 }
 
 # --- Паттерны имён файлов. {0} подставляется как тег кванта (Q4_K_M и т.п.).
 if ($IsGGUF) {
     $LayeredDitPatterns = @('(?i)layered.*-{0}\.gguf$', '(?i)-{0}\.gguf$', '(?i){0}.*\.gguf$')
     $EditDitPatterns    = @('(?i)2511.*-{0}\.gguf$', '(?i)-{0}\.gguf$', '(?i){0}.*\.gguf$')
+    # 2512 - свежая ревизия базовой модели; старые репозитории отдадут первую версию,
+    # поэтому сначала ищем по номеру ревизии и только потом по любому совпадению.
+    $BaseDitPatterns    = @('(?i)2512.*-{0}\.gguf$', '(?i)-{0}\.gguf$', '(?i){0}.*\.gguf$')
 } elseif ($Quant -eq 'fp8') {
     # Для layered годится ТОЛЬКО fp8mixed: обычный fp8_e4m3fn ломает вывод.
     $LayeredDitPatterns = @('(?i)layered.*fp8.?mixed.*\.safetensors$', '(?i)fp8.?mixed.*\.safetensors$')
     $EditDitPatterns    = @('(?i)edit.*2511.*fp8.*\.safetensors$', '(?i)edit.*fp8.*\.safetensors$')
+    $BaseDitPatterns    = @('(?i)qwen_image_2512.*fp8.*\.safetensors$',
+                            '(?i)diffusion_models/qwen_image_fp8.*\.safetensors$')
 } else {
     $LayeredDitPatterns = @('(?i)layered.*bf16.*\.safetensors$', '(?i)diffusion_models/.*bf16.*\.safetensors$')
     $EditDitPatterns    = @('(?i)edit.*2511.*bf16.*\.safetensors$', '(?i)diffusion_models/.*bf16.*\.safetensors$')
+    $BaseDitPatterns    = @('(?i)qwen_image_2512.*bf16.*\.safetensors$', '(?i)diffusion_models/.*bf16.*\.safetensors$')
 }
 
 # --- LoRA. Список: у edit их может быть несколько сразу (ускорение + ракурсы),
@@ -149,6 +174,29 @@ if ($Angles) {
         Prefix   = 'qwen-image-edit-multiple-angles'
     }
 }
+if ($Inpaint) {
+    $EditLoras += @{
+        # UnifiedHorusRA - зеркало Civitai на HF. Запасной ostris работает иначе:
+        # там закрашивают зелёным, а не чёрным, и промпт формулируется по-другому.
+        Repos    = @('UnifiedHorusRA/Qwen_Image_Edit_Easy_Inpaint_LoRA',
+                     'ostris/qwen_image_edit_inpainting')
+        Patterns = @('(?i)\.safetensors$')
+        Label    = 'Easy Inpaint LoRA'
+        Prefix   = 'qwen-image-edit-easy-inpaint'
+    }
+}
+
+# Базовая модель ускоряется своей Lightning LoRA - не той, что у edit.
+$BaseLoras = @()
+if ($Lightning) {
+    $BaseLoras += @{
+        Repos    = @('lightx2v/Qwen-Image-Lightning')
+        Patterns = @('(?i)4steps.*V2.*\.safetensors$', '(?i)4steps.*\.safetensors$',
+                     '(?i)8steps.*\.safetensors$')
+        Label    = 'Lightning LoRA для базовой модели'
+        Prefix   = 'qwen-image-lightning'
+    }
+}
 
 $ModelSpecs = @{
     layered = @{
@@ -169,9 +217,21 @@ $ModelSpecs = @{
         VaePatterns  = @('(?i)vae/qwen_image_vae\.safetensors$', '(?i)vae/.*\.safetensors$')
         Loras        = $EditLoras
     }
+    base = @{
+        Title        = 'Qwen-Image-2512 (генерация с нуля)'
+        DitRepos     = $BaseDitRepos
+        DitPatterns  = $BaseDitPatterns
+        VaeRepos     = @('Comfy-Org/Qwen-Image_ComfyUI')
+        VaePatterns  = @('(?i)vae/qwen_image_vae\.safetensors$', '(?i)vae/.*\.safetensors$')
+        Loras        = $BaseLoras
+    }
 }
 
-$Targets = if ($Model -eq 'both') { @('layered', 'edit') } else { @($Model) }
+$Targets = switch ($Model) {
+    'both'  { @('layered', 'edit') }
+    'all'   { @('layered', 'edit', 'base') }
+    default { @($Model) }
+}
 
 function Write-Step($msg) { Write-Host "`n=== $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [ok] $msg" -ForegroundColor Green }
@@ -270,7 +330,10 @@ $DirDiT     = Join-Path $ModelsDir $(if ($IsGGUF) { 'unet' } else { 'diffusion_m
 $DirTextEnc = Join-Path $ModelsDir 'text_encoders'
 $DirVae     = Join-Path $ModelsDir 'vae'
 $DirLora    = Join-Path $ModelsDir 'loras'
-foreach ($d in @($DirDiT, $DirTextEnc, $DirVae, $DirLora)) {
+# DiffSynth ControlNet в ComfyUI грузится не как ControlNet, а как патч модели
+# (нода ModelPatchLoader), и лежит в отдельной папке.
+$DirPatches = Join-Path $ModelsDir 'model_patches'
+foreach ($d in @($DirDiT, $DirTextEnc, $DirVae, $DirLora, $DirPatches)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
@@ -349,6 +412,20 @@ function Get-RemoteSize {
         if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
     }
     return 0
+}
+
+function Find-AllInRepos {
+    # Как Find-InRepos, но возвращает ВСЕ совпадения из первого доступного
+    # репозитория: у ControlNet-патчей нужен не один файл, а весь набор.
+    param([string[]]$Repos, [string]$Pattern)
+    foreach ($repo in $Repos) {
+        $files = Get-HFFileList $repo
+        if (-not $files) { Write-Warn2 "репозиторий $repo недоступен, пробую следующий"; continue }
+        $hits = @($files | Where-Object { $_ -match $Pattern })
+        if ($hits.Count -gt 0) { return [pscustomobject]@{ Repo = $repo; Paths = $hits } }
+        Write-Warn2 "в $repo нет подходящих файлов, пробую следующий"
+    }
+    return $null
 }
 
 function Get-HFDownload {
@@ -455,6 +532,24 @@ foreach ($target in $Targets) {
     }
 }
 
+# ------------------------------------------------------- ControlNet-патчи
+
+if ($ControlNet) {
+    Write-Step 'DiffSynth ControlNet (canny / depth / inpaint)'
+    $cn = Find-AllInRepos -Repos @('Comfy-Org/Qwen-Image-DiffSynth-ControlNets') `
+                          -Pattern '(?i)model_patches/.*\.safetensors$'
+    if ($cn) {
+        foreach ($path in $cn.Paths) {
+            $kind = if ((Split-Path $path -Leaf) -match '(canny|depth|inpaint)') { $Matches[1] } else { 'patch' }
+            Get-HFDownload -Repo $cn.Repo -RemotePath $path -DestDir $DirPatches -Label "ControlNet $kind"
+        }
+    } else {
+        Write-Warn2 'ControlNet-патчи не найдены.'
+        Write-Host  '      Проверь вручную: https://huggingface.co/Comfy-Org/Qwen-Image-DiffSynth-ControlNets/tree/main'
+        $script:Missing += 'DiffSynth ControlNet'
+    }
+}
+
 # ------------------------------------------------------------- Custom nodes
 
 function Install-CustomNode {
@@ -538,6 +633,7 @@ Write-Host @"
   Text encoder  $DirTextEnc
   VAE           $DirVae
   LoRA          $DirLora
+  ControlNet    $DirPatches
 
 Общее:
   * Перезапусти ComfyUI Desktop - иначе не увидит новые модели и ноды.
@@ -581,6 +677,44 @@ Qwen-Image-Edit-2511:
   * Готовый шаблон: Workflow -> Browse Templates -> "Qwen Multiangle".
 "@ -ForegroundColor Gray
     }
+}
+
+if ($Targets -contains 'base') {
+    Write-Host @"
+
+Qwen-Image-2512 (генерация с нуля):
+  * Обычный txt2img: "Empty Latent Image" -> KSampler, картинка на входе не нужна.
+  * Сильная сторона - текст на изображении: вывески, упаковка, надписи. Пиши
+    нужную надпись в промпте в кавычках, тогда модель воспроизведёт её точнее.
+  * Lightning LoRA здесь СВОЯ, не та что у edit. Обе лежат в loras и различаются
+    по имени - не перепутай, чужая даст замыленный результат.
+"@ -ForegroundColor Gray
+}
+
+if ($ControlNet) {
+    Write-Host @"
+
+ControlNet (DiffSynth-патчи):
+  * Грузятся нодой "ModelPatchLoader" из models\model_patches - это НЕ обычный
+    "Load ControlNet Model", тот их не увидит.
+  * Шаблон: Workflow -> Browse Templates -> "Qwen Image ControlNet Model Patch".
+  * depth и canny работают с готовыми картами: если рендеришь в 3D-пакете,
+    Z-Depth и clay-проход можно отдать напрямую, препроцессор не нужен.
+  * Патч inpaint частично дублирует Easy Inpaint LoRA - это разные механизмы,
+    выбирай по результату, одновременно вешать смысла нет.
+"@ -ForegroundColor Gray
+}
+
+if ($Inpaint) {
+    Write-Host @"
+
+Easy Inpaint LoRA:
+  * Закрась область ЧЁРНЫМ в любом редакторе и начни промпт словами
+    "Inpaint the black areas." - дальше обычная инструкция что нарисовать.
+  * Маски и ноды препроцессинга не нужны, вход - обычная картинка.
+  * Если скачался запасной вариант от ostris - там закрашивают ЗЕЛЁНЫМ,
+    формулировка промпта другая, смотри карточку модели.
+"@ -ForegroundColor Gray
 }
 
 if ($Quant -eq 'q4_k_m') {

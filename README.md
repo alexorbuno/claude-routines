@@ -42,8 +42,11 @@ crontab -e
 - **`-Model edit`** — [Qwen-Image-Edit-2511](https://blog.comfy.org/p/qwen-image-edit-2511-and-qwen-image):
   правит изображение по текстовой инструкции. С `-Lightning` доедет
   [4-шаговая LoRA](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) вместо 40 шагов.
-- **`-Model both`** — обе. Text encoder у них общий, так что второй прогон
-  докачает только DiT и VAE.
+- **`-Model base`** — [Qwen-Image-2512](https://docs.comfy.org/tutorials/image/qwen/qwen-image-2512):
+  генерация с нуля. Декабрьская ревизия базовой модели — реалистичнее люди,
+  детальнее текстуры и заметно точнее рендеринг текста на изображении.
+- **`-Model both`** — layered + edit. **`-Model all`** — все три. Text encoder
+  и VAE общие, так что каждая следующая модель докачивает только свой DiT.
 
 Скрипт сам находит папку ComfyUI, тянет имена файлов из HuggingFace API
 (не хардкодит их, поэтому не ломается при переименованиях), перебирает несколько
@@ -59,8 +62,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model l
 # Редактирование с ускорением до 4 шагов
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model edit -Quant q4_k_m -Lightning
 
-# Всё сразу + управление ракурсом + явный путь к ComfyUI
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model both -Quant q4_k_m -Lightning -Angles -Extras -ComfyUIPath "D:\ComfyUI"
+# Всё сразу: три модели, ускорение, ракурсы, ControlNet, inpaint, QoL-ноды
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model all -Quant q4_k_m -Lightning -Angles -ControlNet -Inpaint -Extras
 ```
 
 Ключ `-Angles` (только для `edit`) ставит управление ракурсом съёмки:
@@ -71,6 +74,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model b
 - [**ComfyUI-qwenmultiangle**](https://github.com/jtydhr88/ComfyUI-qwenmultiangle) —
   3D-вьюпорт на Three.js прямо в ноде: ракурс задаётся мышью, а на выход идёт
   готовый текстовый промпт. Без LoRA нода бесполезна — ракурс будет молча игнорироваться.
+
+Ключ `-ControlNet` кладёт [DiffSynth ControlNet-патчи](https://huggingface.co/Comfy-Org/Qwen-Image-DiffSynth-ControlNets)
+(canny, depth, inpaint) в `models/model_patches`. Важно: в ComfyUI они грузятся
+нодой `ModelPatchLoader`, а не обычным `Load ControlNet Model` — тот их не увидит.
+Для работы с 3D-рендерами это основной инструмент: Z-Depth и clay-проход подаются
+напрямую, препроцессор не нужен.
+
+Ключ `-Inpaint` добавляет [Easy Inpaint LoRA](https://civitai.com/models/1928341/qwen-image-edit-easy-inpaint-lora)
+к edit-модели (качается с [зеркала на HF](https://huggingface.co/UnifiedHorusRA/Qwen_Image_Edit_Easy_Inpaint_LoRA)).
+Механика простая до предела: закрашиваете область чёрным в любом редакторе и
+начинаете промпт словами `Inpaint the black areas.` — ни масок, ни нод препроцессинга.
 
 Ключ `-Extras` доставляет:
 
@@ -116,3 +130,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model b
   она кодирует изображение и промпт совместно, обычный `CLIP Text Encode` не подойдёт.
 - Без Lightning LoRA: ~40 шагов, cfg 4.0. С Lightning: 4 шага, cfg **1.0** —
   на cfg 4.0 с 4 шагами получите пересвет и артефакты.
+
+`base`:
+
+- Обычный txt2img: `Empty Latent Image` → KSampler, картинка на входе не нужна.
+- Lightning LoRA здесь **своя**, не та что у `edit`. Обе лежат в `loras`
+  и различаются по имени — чужая даст замыленный результат.
+- Надписи пишите в промпте в кавычках, так модель воспроизводит их точнее.
