@@ -59,9 +59,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model l
 # Редактирование с ускорением до 4 шагов
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model edit -Quant q4_k_m -Lightning
 
-# Всё сразу + явный путь к ComfyUI
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model both -Quant q4_k_m -Lightning -Extras -ComfyUIPath "D:\ComfyUI"
+# Всё сразу + управление ракурсом + явный путь к ComfyUI
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-qwen-image.ps1 -Model both -Quant q4_k_m -Lightning -Angles -Extras -ComfyUIPath "D:\ComfyUI"
 ```
+
+Ключ `-Angles` (только для `edit`) ставит управление ракурсом съёмки:
+
+- [**Multiple-Angles LoRA**](https://huggingface.co/fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA) —
+  96 позиций камеры (8 азимутов × 4 высоты × 3 крупности), обучена на рендерах
+  Gaussian Splatting. Именно она поворачивает сцену.
+- [**ComfyUI-qwenmultiangle**](https://github.com/jtydhr88/ComfyUI-qwenmultiangle) —
+  3D-вьюпорт на Three.js прямо в ноде: ракурс задаётся мышью, а на выход идёт
+  готовый текстовый промпт. Без LoRA нода бесполезна — ракурс будет молча игнорироваться.
 
 Ключ `-Extras` доставляет:
 

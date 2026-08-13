@@ -39,6 +39,10 @@
 .PARAMETER Extras
     Доставить QoL custom nodes: экспорт слоёв в PSD и монитор VRAM в интерфейсе.
 
+.PARAMETER Angles
+    Управление ракурсом для edit: LoRA Multiple-Angles плюс нода с 3D-вьюпортом,
+    в которой ракурс задаётся мышью, а не текстом.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\setup-qwen-image.ps1 -Model layered -Quant q4_k_m -Extras
 
@@ -63,7 +67,9 @@ param(
 
     [switch]$SkipLora,
 
-    [switch]$Extras
+    [switch]$Extras,
+
+    [switch]$Angles
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,8 +115,40 @@ if ($IsGGUF) {
     $EditDitPatterns    = @('(?i)edit.*2511.*bf16.*\.safetensors$', '(?i)diffusion_models/.*bf16.*\.safetensors$')
 }
 
-$LayeredLoraRepos = if ($SkipLora)  { @() } else { @('StabilityLabs/Stable-Layers') }
-$EditLoraRepos    = if ($Lightning) { @('lightx2v/Qwen-Image-Edit-2511-Lightning') } else { @() }
+# --- LoRA. Список: у edit их может быть несколько сразу (ускорение + ракурсы),
+#     они не конфликтуют и вешаются цепочкой.
+$LayeredLoras = @()
+if (-not $SkipLora) {
+    $LayeredLoras += @{
+        Repos    = @('StabilityLabs/Stable-Layers')
+        Patterns = @('(?i)\.safetensors$')
+        Label    = 'LoRA Stable-Layers'
+        Prefix   = 'stable-layers'
+    }
+}
+
+$EditLoras = @()
+if ($Lightning) {
+    $EditLoras += @{
+        Repos    = @('lightx2v/Qwen-Image-Edit-2511-Lightning')
+        # 4 шага - самый выгодный размен; bf16-вариант работает и поверх GGUF.
+        Patterns = @('(?i)4steps.*bf16.*\.safetensors$', '(?i)4steps.*\.safetensors$',
+                     '(?i)8steps.*\.safetensors$', '(?i)\.safetensors$')
+        Label    = 'Lightning LoRA (4 шага)'
+        Prefix   = 'qwen-image-edit-2511-lightning'
+    }
+}
+if ($Angles) {
+    $EditLoras += @{
+        # Вариант под 2509 - запасной: он для предыдущей версии модели, качество
+        # на 2511 ниже, но лучше чем ничего, если основной репозиторий недоступен.
+        Repos    = @('fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA',
+                     'dx8152/Qwen-Edit-2509-Multiple-angles')
+        Patterns = @('(?i)\.safetensors$')
+        Label    = 'Multiple-Angles LoRA (управление ракурсом)'
+        Prefix   = 'qwen-image-edit-multiple-angles'
+    }
+}
 
 $ModelSpecs = @{
     layered = @{
@@ -120,10 +158,7 @@ $ModelSpecs = @{
         # У layered свой VAE, умеющий альфа-канал. Обычный qwen_image_vae не подойдёт.
         VaeRepos     = @('Comfy-Org/Qwen-Image-Layered_ComfyUI')
         VaePatterns  = @('(?i)vae/.*layered.*\.safetensors$', '(?i)vae/.*\.safetensors$')
-        LoraRepos    = $LayeredLoraRepos
-        LoraPatterns = @('(?i)\.safetensors$')
-        LoraLabel    = 'LoRA Stable-Layers'
-        LoraPrefix   = 'stable-layers'
+        Loras        = $LayeredLoras
     }
     edit = @{
         Title        = 'Qwen-Image-Edit-2511 (правка по инструкции)'
@@ -132,12 +167,7 @@ $ModelSpecs = @{
         # Edit работает на обычном VAE линейки Qwen-Image.
         VaeRepos     = @('Comfy-Org/Qwen-Image_ComfyUI', 'Comfy-Org/Qwen-Image-Edit_ComfyUI')
         VaePatterns  = @('(?i)vae/qwen_image_vae\.safetensors$', '(?i)vae/.*\.safetensors$')
-        LoraRepos    = $EditLoraRepos
-        # 4 шага - самый выгодный размен; bf16-вариант LoRA работает и поверх GGUF.
-        LoraPatterns = @('(?i)4steps.*bf16.*\.safetensors$', '(?i)4steps.*\.safetensors$',
-                         '(?i)8steps.*\.safetensors$', '(?i)\.safetensors$')
-        LoraLabel    = 'Lightning LoRA (4 шага)'
-        LoraPrefix   = 'qwen-image-edit-2511-lightning'
+        Loras        = $EditLoras
     }
 }
 
@@ -405,22 +435,22 @@ foreach ($target in $Targets) {
         $script:Missing += "VAE $target"
     }
 
-    # LoRA
-    if ($spec.LoraRepos.Count -gt 0) {
-        $lora = Find-InRepos -Repos $spec.LoraRepos -Patterns $spec.LoraPatterns
+    # LoRA - их может быть несколько
+    foreach ($ld in $spec.Loras) {
+        $lora = Find-InRepos -Repos $ld.Repos -Patterns $ld.Patterns
         if ($lora) {
             # Безликие имена (adapter_model.safetensors и подобные) в общей папке loras
             # опознать нельзя - сохраняем под именем, говорящим что это за LoRA.
             $leaf   = Split-Path $lora.Path -Leaf
             $saveAs = if ($leaf -match '^adapter_model|^pytorch_lora_weights') {
-                          "$($spec.LoraPrefix)-$leaf"
+                          "$($ld.Prefix)-$leaf"
                       } else { $null }
             Get-HFDownload -Repo $lora.Repo -RemotePath $lora.Path -DestDir $DirLora `
-                           -Label $spec.LoraLabel -SaveAs $saveAs
+                           -Label $ld.Label -SaveAs $saveAs
         } else {
-            Write-Warn2 "$($spec.LoraLabel) не найдена - возможно, репозиторий gated (нужно принять лицензию на HF)."
-            Write-Host  "      Проверь вручную: https://huggingface.co/$($spec.LoraRepos[0])/tree/main"
-            $script:Missing += $spec.LoraLabel
+            Write-Warn2 "$($ld.Label) не найдена - возможно, репозиторий gated (нужно принять лицензию на HF)."
+            Write-Host  "      Проверь вручную: https://huggingface.co/$($ld.Repos[0])/tree/main"
+            $script:Missing += $ld.Label
         }
     }
 }
@@ -465,6 +495,14 @@ if ($IsGGUF) {
     Install-CustomNode -Name 'ComfyUI-GGUF' -RepoUrl 'https://github.com/city96/ComfyUI-GGUF' `
                        -Why 'лоадер GGUF-моделей'
     Write-Warn2 'Нужна python-зависимость gguf. Если ComfyUI не подхватит сам: Manager -> Install Missing Custom Nodes'
+}
+
+if ($Angles -and $Targets -contains 'edit') {
+    Write-Step 'Нода управления ракурсом (-Angles)'
+    # Нода сама картинку не поворачивает: она даёт 3D-вьюпорт и собирает из него
+    # текстовый промпт с формулировками ракурса. Поворот делает LoRA Multiple-Angles.
+    Install-CustomNode -Name 'ComfyUI-qwenmultiangle' -RepoUrl 'https://github.com/jtydhr88/ComfyUI-qwenmultiangle' `
+                       -Why '3D-вьюпорт: ракурс мышью вместо текста'
 }
 
 if ($Extras) {
@@ -530,6 +568,19 @@ Qwen-Image-Edit-2511:
   * Без Lightning LoRA: ~40 шагов, cfg 4.0.
     С Lightning LoRA: 4 шага, cfg 1.0 - иначе получишь пересвет и мусор.
 "@ -ForegroundColor Gray
+
+    if ($Angles) {
+        Write-Host @"
+  * Ракурс: нода "Qwen Multi Angle" даёт 3D-вьюпорт (кольца азимута, наклона
+    и дистанции). Её текстовый выход идёт в "TextEncodeQwenImageEdit" вместо
+    обычного промпта - или склеенным с ним, если правишь ещё что-то.
+  * Сама нода изображение не поворачивает, поворот делает LoRA Multiple-Angles.
+    Без LoRA получишь просто игнор ракурса, без ошибки - это сбивает с толку.
+  * Две LoRA (Lightning + Angles) вешаются цепочкой: LoraLoaderModelOnly подряд.
+    Если ракурс перестанет слушаться, снижай strength у Lightning, а не у Angles.
+  * Готовый шаблон: Workflow -> Browse Templates -> "Qwen Multiangle".
+"@ -ForegroundColor Gray
+    }
 }
 
 if ($Quant -eq 'q4_k_m') {
